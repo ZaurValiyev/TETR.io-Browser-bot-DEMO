@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor settings
+.vscode/
+
+# Browser profile (cookies, logins, session data, can be huge)
+browser_profile/
+
+# Debug output
+debug.png
+
+# Secrets / local environment
+.env
+venv/
+.venv/
