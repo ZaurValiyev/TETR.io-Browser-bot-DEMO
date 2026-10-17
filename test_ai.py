@@ -17,7 +17,7 @@ while pieces < 2000:
         break
     rot, bx, _ = move
     keys = key_plan(rot, bx)
-    assert keys[-1] == "space"
+    assert keys[-1] == "Space"
     # key plan must reproduce the target column from the spawn column
     dx = keys.count("ArrowRight") - keys.count("ArrowLeft")
     assert SPAWN_X + dx == bx
@@ -26,3 +26,13 @@ while pieces < 2000:
     pieces += 1
 
 print(f"survived {pieces} pieces, cleared {total_lines} lines")
+
+# Shape-based piece detection: every piece at spawn (and shifted) must be identified.
+from tetris_ai import identify_piece
+
+for name, rots in SHAPES.items():
+    for shift in range(0, 4):
+        cells = [(r + 1, c + SPAWN_X + shift) for r, c in rots[0]]  # drawn 1 row down
+        got = identify_piece(cells)
+        assert got == (name, SPAWN_X + shift), (name, shift, got)
+print("piece identification OK for all 7 pieces")

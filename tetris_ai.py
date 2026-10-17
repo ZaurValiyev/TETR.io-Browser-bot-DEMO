@@ -136,10 +136,41 @@ def best_placement(board, piece):
     return best
 
 
-def key_plan(rotation, box_x):
-    """Keys to press, in order, to execute a placement from the spawn state."""
+def _build_spawn_lookup():
+    lookup = {}
+    for piece, rots in SHAPES.items():
+        cells = rots[0]
+        mr = min(r for r, _ in cells)
+        mc = min(c for _, c in cells)
+        norm = frozenset((r - mr, c - mc) for r, c in cells)
+        lookup[norm] = (piece, mc)
+    return lookup
+
+
+_SPAWN_LOOKUP = _build_spawn_lookup()
+
+
+def identify_piece(cells):
+    """Identify a freshly spawned piece from its 4 filled (row, col) cells.
+
+    Works from the cell pattern alone (no colours), so it is skin-independent.
+    Returns (piece, current_box_x) or None if the pattern is not a spawn shape.
+    """
+    if len(cells) != 4:
+        return None
+    mr = min(r for r, _ in cells)
+    mc = min(c for _, c in cells)
+    hit = _SPAWN_LOOKUP.get(frozenset((r - mr, c - mc) for r, c in cells))
+    if hit is None:
+        return None
+    piece, offset = hit
+    return piece, mc - offset
+
+
+def key_plan(rotation, box_x, start_x=SPAWN_X):
+    """Keys to press, in order, to execute a placement from the current state."""
     keys = list(ROTATE_KEYS[rotation])
-    dx = box_x - SPAWN_X
+    dx = box_x - start_x
     keys += (["ArrowRight"] if dx > 0 else ["ArrowLeft"]) * abs(dx)
     keys.append("Space")  # hard drop
     return keys

@@ -19,29 +19,18 @@ import cv2
 import numpy as np
 from playwright.sync_api import sync_playwright
 
-from tetris_ai import COLS, ROWS, best_placement, key_plan
+from tetris_ai import COLS, ROWS, best_placement, identify_piece, key_plan
 
 CONFIG = Path("config.json")
 PROFILE_DIR = Path("browser_profile")  # keeps your login between runs
 VIEWPORT = {"width": 1280, "height": 720}
 
 # ---- Tunables -------------------------------------------------------------
-TOP_MASK_ROWS = 3        # rows at the top used to read the *falling* piece
+BUFFER_ROWS = 2          # extra rows read ABOVE the matrix (pieces spawn there)
+TOP_MASK_ROWS = 3        # matrix rows at the top treated as "falling piece" area
 SAT_MIN, VAL_MIN = 70, 90  # HSV thresholds for "this cell is filled"
 KEY_DELAY = 0.012        # seconds between key taps
 POST_DROP_WAIT = 0.20    # let the piece lock and the next one spawn
-MAX_COLOR_DIST = 90      # RGB distance for a piece colour match
-
-# Approximate TETR.IO default-skin colours (RGB). Adjust after `debug`.
-PIECE_RGB = {
-    "Z": (239, 98, 77),
-    "L": (239, 149, 53),
-    "O": (247, 211, 8),
-    "S": (102, 198, 92),
-    "I": (66, 175, 225),
-    "J": (25, 131, 188),
-    "T": (185, 75, 198),
-}
 
 
 # ---- Vision ---------------------------------------------------------------
@@ -51,49 +40,54 @@ def grab(page) -> np.ndarray:
 
 
 def read_grid(img, roi):
-    """Return (grid, rgb) where grid[r][c] is 0/1 and rgb[r][c] the cell colour."""
+    """Read the board as a grid of 0/1 with BUFFER_ROWS extra rows on top.
+
+    Cells are square: size = box width / 10. Rows are counted UP from the box's
+    bottom edge, so it doesn't matter if the box extends above the matrix.
+    Returns BUFFER_ROWS + ROWS rows; index BUFFER_ROWS is the top matrix row.
+    """
     x, y, w, h = roi
-    cw, ch = w / COLS, h / ROWS
+    cell = w / COLS
+    bottom = y + h
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    grid = [[0] * COLS for _ in range(ROWS)]
-    rgb = [[None] * COLS for _ in range(ROWS)]
-    for r in range(ROWS):
+    total = BUFFER_ROWS + ROWS
+    grid = [[0] * COLS for _ in range(total)]
+    for i in range(total):
+        cy = int(bottom - (total - i - 0.5) * cell)
+        if cy < 3 or cy > img.shape[0] - 4:
+            continue
         for c in range(COLS):
-            cx, cy = int(x + (c + 0.5) * cw), int(y + (r + 0.5) * ch)
+            cx = int(x + (c + 0.5) * cell)
             hp = hsv[cy - 2 : cy + 3, cx - 2 : cx + 3].reshape(-1, 3)
             _, s, v = np.median(hp, axis=0)
             if s > SAT_MIN and v > VAL_MIN:
-                grid[r][c] = 1
-                bp = img[cy - 2 : cy + 3, cx - 2 : cx + 3].reshape(-1, 3)
-                b, g, rr = np.median(bp, axis=0)
-                rgb[r][c] = (rr, g, b)
-    return grid, rgb
+                grid[i][c] = 1
+    return grid
 
 
-def detect_piece(rgb):
-    """Identify the falling piece from the filled cells in the top rows."""
-    cells = [rgb[r][c] for r in range(TOP_MASK_ROWS) for c in range(COLS) if rgb[r][c]]
-    if len(cells) < 3:
-        return None
-    mean = np.mean(cells, axis=0)
-    name, dist = min(
-        ((p, float(np.linalg.norm(mean - np.array(col)))) for p, col in PIECE_RGB.items()),
-        key=lambda t: t[1],
-    )
-    return name if dist < MAX_COLOR_DIST else None
+def spawn_cells(grid):
+    """Filled cells in the spawn area: buffer rows plus the top matrix rows."""
+    last = BUFFER_ROWS + TOP_MASK_ROWS
+    return [(r, c) for r in range(last) for c in range(COLS) if grid[r][c]]
 
-def describe_top(rgb):
-    cells = [rgb[r][c] for r in range(TOP_MASK_ROWS) for c in range(COLS) if rgb[r][c]]
-    if not cells:
-        return "no filled cells in top rows"
-    mean = np.mean(cells, axis=0)
-    dists = sorted((float(np.linalg.norm(mean - np.array(col))), p) for p, col in PIECE_RGB.items())
-    return f"{len(cells)} cells, mean RGB={tuple(int(v) for v in mean)}, nearest: {dists[0][1]} d={dists[0][0]:.0f}, then {dists[1][1]} d={dists[1][0]:.0f}"
+
+def detect_piece(grid):
+    """Identify the falling piece by SHAPE. Returns (piece, box_x) or None."""
+    return identify_piece(spawn_cells(grid))
+
+
+def matrix_for_ai(grid):
+    """The 20 matrix rows, with the falling-piece area cleared."""
+    board = [row[:] for row in grid[BUFFER_ROWS:]]
+    for r in range(TOP_MASK_ROWS):
+        board[r] = [0] * COLS
+    return board
+
 
 def ascii_board(grid, piece):
-    lines = [f"piece: {piece}"]
-    for r, row in enumerate(grid):
-        tag = "^" if r < TOP_MASK_ROWS else " "
+    lines = [f"piece: {piece}   (^ = spawn area, ~ = above matrix)"]
+    for i, row in enumerate(grid):
+        tag = "~" if i < BUFFER_ROWS else ("^" if i < BUFFER_ROWS + TOP_MASK_ROWS else " ")
         lines.append(tag + "".join("#" if v else "." for v in row))
     return "\n".join(lines)
 
@@ -135,10 +129,18 @@ def debug():
         ctx, page = open_game(p)
         input("Start a game, then press Enter to capture one frame...")
         img = grab(page)
-        grid, rgb = read_grid(img, roi)
-        print(ascii_board(grid, detect_piece(rgb)))
+        grid = read_grid(img, roi)
+        print(ascii_board(grid, detect_piece(grid)))
         x, y, w, h = roi
         cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 1)
+        cell = w / COLS  # draw the cell centres that are actually sampled
+        total = BUFFER_ROWS + ROWS
+        for i in range(total):
+            for c in range(COLS):
+                px = int(x + (c + 0.5) * cell)
+                py = int(y + h - (total - i - 0.5) * cell)
+                col = (0, 0, 255) if grid[i][c] else (255, 255, 0)
+                cv2.circle(img, (px, py), 2, col, -1)
         cv2.imwrite("debug.png", img)
         print("Saved debug.png (green box = region being read)")
         ctx.close()
@@ -152,22 +154,19 @@ def play():
         placed = 0
         try:
             while True:
-                grid, rgb = read_grid(grab(page), roi)
-                piece = detect_piece(rgb)
-                if piece is None:
-                    filled = sum(map(sum, grid))
-                    print(describe_top(rgb) + "    ", end="\r")
+                grid = read_grid(grab(page), roi)
+                found = detect_piece(grid)
+                if found is None:
+                    print(f"no piece (spawn-area cells: {len(spawn_cells(grid))})    ", end="\r")
                     time.sleep(0.03)
                     continue
-                board = [row[:] for row in grid]
-                for r in range(TOP_MASK_ROWS):  # hide the falling piece from the AI
-                    board[r] = [0] * COLS
-                move = best_placement(board, piece)
+                piece, cur_x = found
+                move = best_placement(matrix_for_ai(grid), piece)
                 if move is None:
                     time.sleep(0.2)
                     continue
                 rot, bx, _ = move
-                for key in key_plan(rot, bx):
+                for key in key_plan(rot, bx, cur_x):
                     page.keyboard.press(key)
                     time.sleep(KEY_DELAY)
                 placed += 1
