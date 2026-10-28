@@ -55,13 +55,19 @@ VERIFY_MIN_KEYS = 4      # in "auto", verify moves with at least this many key p
 PIPELINE = True          # think about the next piece while this one's keys are being pressed
 VERIFY_WAIT = 0.03       # let the game draw the last move before checking
 VERIFY_TRIES = 2         # max correction rounds per piece
-CLEAR_ANIM = 0.25        # after a line clear, ignore "stable" screens younger than this
+LAG_FRAMES = 5           # frames to wait for the game to catch up before calling a key "missed"
+LAG_WAIT = 0.017
+MAX_GARBAGE_RISE = 10    # garbage rows that may arrive between two of our pieces
+CLEAR_ANIM = 0.25
+MAX_RESYNC_SHOTS = 30    # resync screenshots saved per run (annotated + raw)
+FLASH_DELTA = 8          # board brightness change that counts as a screen flash        # after a line clear, ignore "stable" screens younger than this
 # Board vision
 BUFFER_ROWS = 2          # rows read ABOVE the matrix (pieces spawn there)
 TOP_MASK_ROWS = 3        # top matrix rows treated as "falling piece" area
 SAT_MIN, VAL_MIN = 70, 90
 BUFFER_BG_DIST = 60
 GRAY_V_MIN, GRAY_V_MAX = 55, 200
+GARBAGE_ROW_SLACK = 2    # a grey row counts as garbage with >= COLS - this many grey cells
 GHOST_FILTER = True      # remove a ghost piece that was read as stack
 # Panels, in board-cell units relative to the matrix (x = left edge, top = top edge).
 # Run `python bot.py debug` and check the drawn boxes if your layout differs.
@@ -142,7 +148,17 @@ def read_grid(img, roi):
     cx = (x + (np.arange(COLS) + 0.5) * cell).astype(int)
     med = _patch_median(cv2.cvtColor(img, cv2.COLOR_BGR2HSV), cy, cx)
     s, v = med[..., 1], med[..., 2]
-    filled = ((s > SAT_MIN) & (v > VAL_MIN)) | ((s <= SAT_MIN) & (v > GRAY_V_MIN) & (v < GRAY_V_MAX))
+    colour = (s > SAT_MIN) & (v > VAL_MIN)
+    gray = (s <= SAT_MIN) & (v > GRAY_V_MIN) & (v < GRAY_V_MAX)
+    # Grey cells are only garbage if they form garbage rows: rows with (almost) no gap,
+    # stacked in one block from the floor up. Anything else grey is UI drawn over the
+    # matrix (e.g. the "DROP faster / PLACE instantly" hint icons) and is ignored.
+    keep = np.zeros(total, bool)
+    for r in range(total - 1, BUFFER_ROWS - 1, -1):
+        if gray[r].sum() < COLS - GARBAGE_ROW_SLACK:
+            break
+        keep[r] = True
+    filled = colour | (gray & keep[:, None])
     filled &= valid[:, None]
     # Above the matrix the background can be colourful: drop cells that look like it.
     rxs = np.array([rx for rx in (int(x - 12), int(x + w + 12)) if 3 <= rx < Wd - 3])
@@ -264,6 +280,55 @@ def clear_cells(board, cells):
     return b
 
 
+def match_board(sim, vis, piece, cur_x):
+    """Does the screen show our model, possibly pushed up by k garbage rows?
+
+    Returns (board, k) or (None, 0). The ghost is removed for each candidate separately,
+    because garbage moves the ghost up too.
+    """
+    for k in range(MAX_GARBAGE_RISE + 1):
+        if k and any(sim[:k]):
+            break  # stack would be pushed above the matrix: not a plain garbage rise
+        cand = list(sim) if k == 0 else list(sim[k:]) + list(vis[ROWS - k:])
+        if k and any(bin(r).count("1") != COLS - 1 for r in cand[ROWS - k:]):
+            continue  # garbage rows have exactly one hole
+        v = clear_cells(vis, landing_cells(cand, piece, cur_x))
+        if v[TOP_MASK_ROWS:] == cand[TOP_MASK_ROWS:]:
+            return cand, k
+    return None, 0
+
+
+def path_poses(pl):
+    """(rot, x) of every state on the planned key path, start included."""
+    out, s = set(), pl.state
+    while s is not None:
+        out.add(s[:2])
+        prev = pl.parents[s]
+        s = prev[0] if prev else None
+    return out
+
+
+def settled_pose(cap, board, pl, target):
+    """Pose of the falling piece once the game has caught up with the keys already sent.
+
+    A screenshot can lag the game by a frame or two. If it shows the piece somewhere ON the
+    planned path, the game just hasn't drawn the last inputs yet: correcting from that frame
+    would press the same keys twice (overshoot, double rotation). So wait for it to finish;
+    only a pose OFF the path, seen in two frames in a row, counts as a real miss.
+    """
+    path = path_poses(pl)
+    prev = pose = None
+    for _ in range(LAG_FRAMES):
+        pose = find_active(read_grid(cap.grab(), cap.roi), board, pl.piece)
+        if pose is None or drop_cells(board, pl.piece, *pose) == target:
+            return pose
+        if pose[:2] not in path and prev is not None and prev[:2] == pose[:2]:
+            return pose
+        prev = pose
+        time.sleep(LAG_WAIT)
+    return pose
+
+
 def _match_piece(piece, cells):
     """Which (rot, x, y) of `piece` covers exactly these cells, if any."""
     want = set(cells)
@@ -273,6 +338,33 @@ def _match_piece(piece, cells):
                 if {(y + r, x + c) for r, c in SHAPES[piece][rot]} == want:
                     return rot, x, y
     return None
+
+
+def diff_expected(sim, vis):
+    """Cells where the screen disagrees with the board we expected after the last lock."""
+    extra, missing = [], []
+    for y in range(TOP_MASK_ROWS, ROWS):
+        for c in range(COLS):
+            a, b = (sim[y] >> c) & 1, (vis[y] >> c) & 1
+            if b and not a:
+                extra.append((y, c))
+            elif a and not b:
+                missing.append((y, c))
+    def fmt(cells):
+        return " ".join(f"r{y}c{c}" for y, c in cells[:8]) + (" ..." if len(cells) > 8 else "")
+    out = []
+    if extra:
+        out.append(f"{len(extra)} extra [{fmt(extra)}]")
+    if missing:
+        out.append(f"{len(missing)} missing [{fmt(missing)}]")
+    return "vs expected: " + (", ".join(out) or "identical")
+
+
+def board_brightness(img, roi):
+    """Mean brightness of the matrix: jumps when the game flashes (danger warning etc.)."""
+    x, y, w, h = roi
+    crop = img[max(0, y):y + h, max(0, x):x + w]
+    return float(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[..., 2].mean()) if crop.size else 0.0
 
 
 def explain_resync(prev, vis, pl):
@@ -595,7 +687,8 @@ def play(use_hold=True):
         placed, sent_total, t_first = 0, 0, None
         miss_since, saved = None, 0
         expected, prev_board, last_pl, resyncs, last_lines = None, None, None, 0, 0
-        corrections = 0
+        corrections, garbage_in = 0, 0
+        bright_ref, saved_resync = None, 0
         verify_all = VERIFY is True
         pool = ThreadPoolExecutor(max_workers=1) if PIPELINE else None
         pre = None   # (inputs it was computed for, future) of the next piece's decision
@@ -632,39 +725,49 @@ def play(use_hold=True):
                 if expected is not None and fresh:
                     piece, cur_x = expected, SPAWN_X
                 vis = board_bits(st["grid"], st["falling"])
+                board = None
                 if sim is not None:
-                    # The ghost sits exactly where the piece would land: that spot is empty for sure.
-                    vis_clean = clear_cells(vis, landing_cells(sim, piece, cur_x))
-                else:
-                    vis_clean = strip_ghost(vis, piece, cur_x) if GHOST_FILTER else vis
-                same = lambda b: b[TOP_MASK_ROWS:] == sim[TOP_MASK_ROWS:]
-                if sim is not None and not same(vis_clean):
-                    # Don't trust one frame: line-clear and lock animations draw fading cells.
-                    # Re-read until the screen matches our model or shows the same board twice.
-                    last_read = vis_clean
-                    t_settle = time.time()
-                    min_wait = CLEAR_ANIM if last_lines else 0.0
-                    for _ in range(SETTLE_FRAMES + (8 if last_lines else 0)):
-                        time.sleep(SETTLE_WAIT)
-                        img = cap.grab()
-                        st2 = read_state(img, cap.roi)
-                        v2 = board_bits(st2["grid"], st2["falling"])
-                        v2 = clear_cells(v2, landing_cells(sim, piece, cur_x))
-                        st["grid"] = st2["grid"]
-                        if same(v2) or (v2 == last_read and time.time() - t_settle >= min_wait):
-                            vis_clean = v2
-                            break
-                        last_read = v2
-                if sim is not None and same(vis_clean):
-                    board = sim
-                else:
+                    # Our model, maybe pushed up by garbage (normal in versus, not an error).
+                    board, rise = match_board(sim, vis, piece, cur_x)
+                    if board is None:
+                        # Don't trust one frame: line-clear and lock animations draw fading cells.
+                        # Re-read until the screen matches our model or shows the same board twice.
+                        last_read = None
+                        t_settle = time.time()
+                        min_wait = CLEAR_ANIM if last_lines else 0.0
+                        for _ in range(SETTLE_FRAMES + (8 if last_lines else 0)):
+                            time.sleep(SETTLE_WAIT)
+                            img = cap.grab()
+                            st2 = read_state(img, cap.roi)
+                            st["grid"] = st2["grid"]
+                            vis = board_bits(st2["grid"], st2["falling"])
+                            board, rise = match_board(sim, vis, piece, cur_x)
+                            if board is not None:
+                                break
+                            if vis == last_read and time.time() - t_settle >= min_wait:
+                                break
+                            last_read = vis
+                    if board is not None:
+                        garbage_in += rise
+                        b_now = board_brightness(img, cap.roi)
+                        bright_ref = b_now if bright_ref is None else 0.95 * bright_ref + 0.05 * b_now
+                if board is None:
+                    if sim is not None:
+                        # The ghost sits exactly where the piece would land: that spot is empty.
+                        vis = clear_cells(vis, landing_cells(sim, piece, cur_x))
+                    board = strip_ghost(vis, piece, cur_x) if GHOST_FILTER else vis
                     if sim is not None:
                         resyncs += 1
-                        why = explain_resync(prev_board, vis_clean, last_pl)
-                        print(f"\nresync #{resyncs}: {why}")
-                        if resyncs <= 5:
+                        why = explain_resync(prev_board, board, last_pl)
+                        bright = board_brightness(img, cap.roi)
+                        flash = f" FLASH? brightness {bright:.0f} vs normal {bright_ref:.0f}" \
+                            if bright_ref and abs(bright - bright_ref) > FLASH_DELTA else ""
+                        print(f"\nresync #{resyncs}: {why}\n    {diff_expected(sim, vis)}"
+                              f" (brightness {bright:.0f}){flash}")
+                        if saved_resync < MAX_RESYNC_SHOTS:
+                            saved_resync += 1
                             cv2.imwrite(f"resync_{resyncs}.png", annotate(img, cap.roi, st["grid"]))
-                    board = strip_ghost(vis_clean, piece, cur_x) if GHOST_FILTER else vis_clean
+                            cv2.imwrite(f"resync_{resyncs}_raw.png", img)
                 hold = (st["hold"] or tracked_hold) if use_hold else None
                 dec = None
                 if pre is not None:
@@ -710,10 +813,9 @@ def play(use_hold=True):
                 if VERIFY and (verify_all or risky):
                     for _ in range(VERIFY_TRIES):
                         time.sleep(VERIFY_WAIT)
-                        g3 = read_grid(cap.grab(), cap.roi)
-                        pose = find_active(g3, board, pl.piece)
-                        if pose is None or (drop_cells(board, pl.piece, *pose)
-                                            == drop_cells(board, pl.piece, pl.rot, pl.x, pl.y)):
+                        target = drop_cells(board, pl.piece, pl.rot, pl.x, pl.y)
+                        pose = settled_pose(cap, board, pl, target)
+                        if pose is None or drop_cells(board, pl.piece, *pose) == target:
                             break
                         new_pl, fix = correction(board, pl, pose)
                         if new_pl is None:
@@ -744,7 +846,7 @@ def play(use_hold=True):
                 spin = {0: "", 1: " T-spin mini", 2: " T-SPIN"}[pl.spin]
                 held = " (from hold)" if dec.use_hold else ""
                 print(f"#{placed} {pl.piece}{held}{spin} lines={lines} sent={sent} b2b={b2b} combo={combo} "
-                      f"| total sent {sent_total}, {pps:.2f} PPS, fixes {corrections}, "
+                      f"| sent {sent_total}, got {garbage_in}, {pps:.2f} PPS, fixes {corrections}, "
                       f"pre-thought {reused}      ", end="\r")
         except KeyboardInterrupt:
             print("\nStopped.")
